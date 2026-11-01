@@ -1,0 +1,90 @@
+# main.py
+import ustruct
+from machine import Pin, Timer
+from utime import sleep_us
+from i2cslave import I2CSlave
+
+# Constantes de configuración
+SLAVE_ADDR = 0x0A
+ZX_PIN = 2
+TRIAC_PIN = 3
+BOARD_LED = 25  # LED integrado de la Pico
+
+# Variables globales
+power = 0.0
+pdelay = 8200  # Retardo predeterminado en microsegundos (0% de potencia)
+trigger_timer = Timer()
+
+# Configuración de pines de salida
+triac_pin = Pin(TRIAC_PIN, Pin.OUT)
+triac_pin.value(0)
+
+board_led = Pin(BOARD_LED, Pin.OUT)
+board_led.value(0)
+
+def calcular_pdelays(p):
+    """Calcula el retardo exacto en microsegundos limitando los extremos problemáticos"""
+    if p >= 99:
+        return 200     # Máximo brillo seguro
+    elif p <= 1:
+        return 8200    # Apagado total seguro (evita zonas muertas de parpadeo)
+    
+    # Mapeo lineal suave
+    retardo = int(8200 - (p / 100.0) * 7700)
+    return max(300, min(8000, retardo))
+
+def enviar_pulso_triac(timer):
+    """Dispara el triac de forma limpia"""
+    triac_pin.value(1)
+    sleep_us(30)
+    triac_pin.value(0)
+
+def zx_handle(pin):
+    """Interrupción de cruce por cero corregida"""
+    global pdelay
+    # Apagamos el triac inmediatamente en el cruce por cero
+    triac_pin.value(0)
+    
+    # Si no está apagado al 0%
+    if pdelay < 8200:
+        # Convertimos microsegundos a milisegundos con precisión de punto flotante para el Timer
+        delay_ms = pdelay / 1000.0
+        trigger_timer.init(mode=Timer.ONE_SHOT, period=int(delay_ms), callback=enviar_pulso_triac)
+
+# Configuración de la interrupción por cruce por cero en GPIO2
+zx_pin = Pin(ZX_PIN, Pin.IN, Pin.PULL_UP)
+zx_pin.irq(trigger=Pin.IRQ_RISING | Pin.IRQ_FALLING, handler=zx_handle)
+
+# Inicializar esclavo I2C (pines SDA=20, SCL=21)
+i2c = I2CSlave(
+    id=0,
+    address=SLAVE_ADDR,
+    sda=20,
+    scl=21
+)
+
+print("Sistema de control de brillo I2C iniciado (Corregido)")
+print("Direccion: 0x0A | SDA: GPIO20 | SCL: GPIO21")
+
+# Bucle principal
+while True:
+    try:
+        if i2c.rxBufferCount() >= 4:
+            data = i2c.read()
+            if len(data) == 4:
+                power = ustruct.unpack('<f', data)[0]
+                power = max(0.0, min(100.0, power))
+                
+                print(f"Potencia recibida: {power:.2f}%")
+                
+                # Actualiza el retardo
+                pdelay = calcular_pdelays(power)
+                
+                # Responder a la Raspberry Pi
+                respuesta = ustruct.pack('<f', power)
+                i2c.write(respuesta)
+        else:
+            sleep_us(100)
+            
+    except Exception as e:
+        print("Error en bucle I2C:", e)
